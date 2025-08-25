@@ -7,7 +7,7 @@ import torch.distributed as dist
 
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.utils import has_deep_ep, has_pplx
+from vllm.utils import has_deep_ep, has_pplx, has_mori
 
 from .base_device_communicator import All2AllManagerBase, Cache
 
@@ -262,3 +262,302 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         # in get_or_create must be updated.
         handle.set_num_sms(self.num_sms)
         return handle
+
+class MoriAll2AllManager(All2AllManagerBase):
+    """
+    All2All communication based on mori kernels.
+    Migration from DeepEP to mori for AMD GPU support.
+    """
+
+    def __init__(self, cpu_group):
+        assert has_mori(
+        ), "mori not found. Please follow https://github.com/ROCm/mori/blob/main/README.md#installation to install mori."  # noqa
+
+        super().__init__(cpu_group)
+        self.handle_cache = Cache()
+        self.config = None
+        self._op_handles = {}  # Cache for EpDispatchCombineOp instances
+
+        # Initialize mori shmem if not already done
+        self._initialize_mori_shmem()
+
+    def _initialize_mori_shmem(self):
+        """Initialize mori's shared memory system"""
+        import mori.shmem
+        import torch.distributed as dist
+
+        try:
+            # Register the process group for mori
+            world_group = dist.group.WORLD
+            if world_group is not None:
+                torch._C._distributed_c10d._register_process_group("default", world_group)
+
+            # Initialize mori shared memory
+            mori.shmem.shmem_torch_process_group_init("default")
+            logger.debug(f"[rank {self.rank}] mori shmem initialized successfully")
+        except Exception as e:
+            logger.error(f"[rank {self.rank}] mori shmem init failed: {e}")
+            raise
+
+    def _make_mori_config(self, max_num_tokens: int, num_local_experts: int,
+                          experts_per_token: int, hidden_dim: int,
+                          data_type: torch.dtype = torch.bfloat16):
+        """Create mori EpDispatchCombineConfig"""
+        import mori.ops.dispatch_combine as mori_ops
+        from mori.ops.dispatch_combine import EpDispatchCombineKernelType
+
+        # Determine data type size
+        dtype_to_size = {
+            torch.float32: 4,
+            torch.bfloat16: 2,
+            torch.float16: 2,
+        }
+        max_token_type_size = dtype_to_size.get(data_type, 2)
+
+        config = mori_ops.EpDispatchCombineConfig(
+            data_type=data_type,
+            rank=self.dp_rank,  # Use dp_rank for expert parallelism
+            world_size=self.dp_world_size,
+            hidden_dim=hidden_dim,
+            max_num_inp_token_per_rank=max_num_tokens,
+            num_experts_per_rank=num_local_experts,
+            num_experts_per_token=experts_per_token,
+
+            # Performance tuning parameters (can be optimized later)
+            warp_num_per_block=8,  # Good default for MI300X
+            block_num=80,          # Good default for MI300X
+            max_token_type_size=max_token_type_size,
+
+            # Quantization support (disabled for now)
+            scale_dim=0,
+            scale_type_size=0,
+
+            # Use internal buffer management
+            use_external_inp_buf=False,
+
+            # Determine kernel type based on topology
+            kernel_type=(EpDispatchCombineKernelType.InterNode
+                        if self.internode
+                        else EpDispatchCombineKernelType.IntraNode)
+        )
+
+        return config
+
+    def get_handle(self, kwargs):
+        """
+        Get or create mori operation handle.
+        Args:
+            kwargs: Dictionary with keys:
+                - max_num_tokens: Maximum tokens per DP rank
+                - num_local_experts: Number of local experts
+                - experts_per_token: Number of experts per token (topk)
+                - hidden_dim: Hidden dimension size
+                - data_type: Tensor data type (optional, default bfloat16)
+        """
+        import mori.ops.dispatch_combine as mori_ops
+
+        # Extract parameters
+        max_num_tokens = kwargs.get('max_num_tokens')
+        num_local_experts = kwargs.get('num_local_experts')
+        experts_per_token = kwargs.get('experts_per_token')
+        hidden_dim = kwargs.get('hidden_dim')
+        data_type = kwargs.get('data_type', torch.bfloat16)
+
+        # Validate required parameters
+        if any(param is None for param in [max_num_tokens, num_local_experts,
+                                          experts_per_token, hidden_dim]):
+            raise ValueError("Missing required parameters for mori handle creation")
+
+        # Create cache key
+        cache_key = (max_num_tokens, num_local_experts, experts_per_token,
+                    hidden_dim, data_type)
+
+        # Check cache first
+        if cache_key in self._op_handles:
+            return self._op_handles[cache_key]
+
+        # Create new mori configuration and operation
+        config = self._make_mori_config(
+            max_num_tokens=max_num_tokens,
+            num_local_experts=num_local_experts,
+            experts_per_token=experts_per_token,
+            hidden_dim=hidden_dim,
+            data_type=data_type
+        )
+
+        # Create operation handle
+        op = mori_ops.EpDispatchCombineOp(config)
+
+        # Cache the handle
+        self._op_handles[cache_key] = op
+
+        logger.debug(f"[rank {self.dp_rank}] Created mori handle with config: "
+                    f"tokens={max_num_tokens}, experts={num_local_experts}, "
+                    f"topk={experts_per_token}, hidden={hidden_dim}")
+
+        return op
+
+    def dispatch(self, hidden_states: torch.Tensor,
+                 router_logits: torch.Tensor):
+        """
+        Dispatch tokens to appropriate experts using mori kernels.
+
+        Args:
+            hidden_states: Input token embeddings [num_tokens, hidden_dim]
+            router_logits: Router outputs [num_tokens, num_global_experts]
+
+        Returns:
+            Tuple of (dispatched_hidden_states, dispatched_router_logits)
+        """
+        # Get forward context for metadata
+        forward_ctx = get_forward_context()
+        dp_metadata = forward_ctx.dp_metadata
+
+        # Get handle from cache
+        handle = self.get_handle({
+            'max_num_tokens': dp_metadata.max_num_tokens_per_dp_rank,
+            'num_local_experts': dp_metadata.num_local_experts,
+            'experts_per_token': dp_metadata.num_experts_per_token,
+            'hidden_dim': hidden_states.size(-1),
+            'data_type': hidden_states.dtype
+        })
+
+        # Prepare token indices from router logits
+        # This converts router logits to expert indices for each token
+        token_indices = self._prepare_token_indices(
+            router_logits, dp_metadata.num_experts_per_token
+        )
+
+        # Prepare weights from router logits
+        weights = self._prepare_weights(
+            router_logits, dp_metadata.num_experts_per_token
+        )
+
+        # Prepare scales (empty for now, no FP8 quantization)
+        scales = torch.empty((hidden_states.size(0), 0),
+                           dtype=torch.float32,
+                           device=hidden_states.device)
+
+        try:
+            # Perform mori dispatch
+            dispatch_output, dispatch_weights, dispatch_scales, \
+            dispatch_indices, dispatch_recv_num_token = handle.dispatch(
+                input=hidden_states,
+                weights=weights,
+                scales=scales,
+                indices=token_indices,
+                block_num=-1,  # Use default
+                warp_per_block=-1  # Use default
+            )
+
+            # Store dispatch results in forward context for combine phase
+            forward_ctx.mori_dispatch_cache = {
+                'dispatch_output': dispatch_output,
+                'dispatch_weights': dispatch_weights,
+                'dispatch_indices': dispatch_indices,
+                'handle': handle,
+                'num_received_tokens': dispatch_recv_num_token
+            }
+
+            logger.debug(f"[rank {self.dp_rank}] dispatch completed, "
+                        f"received {dispatch_recv_num_token[0] if dispatch_recv_num_token.numel() > 0 else 0} tokens")
+
+            return dispatch_output, self._reconstruct_router_logits(
+                dispatch_weights, dispatch_indices)
+
+        except Exception as e:
+            logger.error(f"[rank {self.dp_rank}] mori dispatch failed: {e}")
+            raise
+
+    def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Combine expert outputs back to original token order using mori kernels.
+
+        Args:
+            hidden_states: Expert outputs [num_received_tokens, hidden_dim]
+
+        Returns:
+            Combined hidden states [num_local_tokens, hidden_dim]
+        """
+        # Get cached dispatch results from forward context
+        forward_ctx = get_forward_context()
+        if not hasattr(forward_ctx, 'mori_dispatch_cache'):
+            raise RuntimeError("No mori dispatch cache found. Must call dispatch() first.")
+
+        cache = forward_ctx.mori_dispatch_cache
+        handle = cache['handle']
+        dispatch_weights = cache['dispatch_weights']
+        dispatch_indices = cache['dispatch_indices']
+
+        try:
+            # Perform mori combine
+            combined_output, combined_weights = handle.combine(
+                input=hidden_states,
+                weights=dispatch_weights,
+                indices=dispatch_indices,
+                block_num=-1,  # Use default
+                warp_per_block=-1  # Use default
+            )
+
+            logger.debug(f"[rank {self.dp_rank}] combine completed")
+
+            # Clean up cache
+            delattr(forward_ctx, 'mori_dispatch_cache')
+
+            return combined_output
+
+        except Exception as e:
+            logger.error(f"[rank {self.dp_rank}] mori combine failed: {e}")
+            raise
+
+    def _prepare_token_indices(self, router_logits: torch.Tensor,
+                              experts_per_token: int) -> torch.Tensor:
+        """Convert router logits to token indices for mori"""
+        num_tokens = router_logits.size(0)
+        num_global_experts = router_logits.size(1)
+
+        # Get top-k expert indices
+        topk_logits, topk_indices = torch.topk(
+            router_logits, experts_per_token, dim=-1
+        )
+
+        # Convert global expert indices to local expert indices within DP rank
+        num_experts_per_rank = num_global_experts // self.dp_world_size
+        local_expert_indices = topk_indices % num_experts_per_rank
+
+        # Flatten for mori format: [num_tokens * experts_per_token]
+        token_indices = local_expert_indices.view(-1).to(torch.int32)
+
+        return token_indices
+
+    def _prepare_weights(self, router_logits: torch.Tensor,
+                        experts_per_token: int) -> torch.Tensor:
+        """Extract top-k weights from router logits"""
+        topk_logits, _ = torch.topk(router_logits, experts_per_token, dim=-1)
+
+        # Apply softmax to get routing weights
+        routing_weights = torch.softmax(topk_logits, dim=-1)
+
+        return routing_weights.to(torch.float32)
+
+    def _reconstruct_router_logits(self, weights: torch.Tensor,
+                                  indices: torch.Tensor) -> torch.Tensor:
+        """Reconstruct router logits from dispatched weights and indices"""
+        # For now, just return the weights - this may need refinement
+        # based on how vllm uses the returned router logits
+        return weights
+
+    def destroy(self):
+        """Clean up mori resources"""
+        try:
+            import mori.shmem
+
+            # Clear operation handle cache
+            self._op_handles.clear()
+
+            # Finalize mori shared memory
+            mori.shmem.shmem_finalize()
+            logger.debug(f"[rank {self.dp_rank}] mori resources cleaned up")
+
+        except Exception as e:
+            logger.warning(f"[rank {self.dp_rank}] Error during mori cleanup: {e}")

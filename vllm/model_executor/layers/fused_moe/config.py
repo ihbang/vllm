@@ -191,6 +191,11 @@ class FusedMoEParallelConfig:
                 and envs.VLLM_ALL2ALL_BACKEND == "deepep_low_latency")
 
     @property
+    def use_mori_kernels(self):
+        return (self.use_all2all_kernels
+                and envs.VLLM_ALL2ALL_BACKEND == "mori")
+
+    @property
     def use_flashinfer_cutlass_kernels(self):
         return (envs.VLLM_USE_FLASHINFER_MOE_FP4
                 and has_flashinfer_cutlass_fused_moe()
@@ -401,6 +406,10 @@ class FusedMoEConfig:
     @property
     def use_deepep_ll_kernels(self):
         return self.moe_parallel_config.use_deepep_ll_kernels
+
+    @property
+    def use_mori_kernels(self):
+        return self.moe_parallel_config.use_mori_kernels
 
     @property
     def use_flashinfer_cutlass_kernels(self):

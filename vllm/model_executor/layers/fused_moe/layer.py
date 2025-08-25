@@ -35,7 +35,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
-from vllm.utils import (direct_register_custom_op, has_deep_ep, has_pplx,
+from vllm.utils import (direct_register_custom_op, has_deep_ep, has_mori, has_pplx,
                         round_up)
 
 if current_platform.is_cuda_alike():
@@ -48,6 +48,8 @@ if current_platform.is_cuda_alike():
         from .deepep_ht_prepare_finalize import DeepEPHTPrepareAndFinalize
         from .deepep_ll_prepare_finalize import (DEEPEP_QUANT_BLOCK_SHAPE,
                                                  DeepEPLLPrepareAndFinalize)
+    if has_mori():
+        from .mori_prepare_finalize import MoriPrepareAndFinalize
 else:
     fused_experts = None  # type: ignore
     FusedMoEPermuteExpertsUnpermute = None  # type: ignore
@@ -185,6 +187,20 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 max_tokens_per_rank=moe.max_num_tokens,
                 num_dispatchers=all2all_manager.world_size,
                 use_fp8_dispatch=use_fp8_dispatch,
+            )
+        elif moe.use_mori_kernels:
+            all_to_all_args = dict(
+                max_num_tokens=moe.max_num_tokens,
+                num_local_experts=moe.num_local_experts,
+                experts_per_token=moe.experts_per_token,
+                hidden_dim=moe.hidden_dim,
+            )
+            handle = all2all_manager.get_handle(all_to_all_args)
+            prepare_finalize = MoriPrepareAndFinalize(
+                handle,
+                max_num_tokens=moe.max_num_tokens,
+                num_local_experts=moe.num_local_experts,
+                num_dispatchers=all2all_manager.world_size,
             )
 
         return prepare_finalize
@@ -918,6 +934,7 @@ class FusedMoE(CustomOp):
         self.batched_router_logits: Optional[torch.Tensor] = None
         if (self.moe_parallel_config.use_pplx_kernels
                 or self.moe_parallel_config.use_deepep_ll_kernels
+                or self.moe_parallel_config.use_mori_kernels
                 or self.moe_parallel_config.use_flashinfer_cutlass_kernels):
             self.batched_hidden_states = torch.zeros(
                 (moe.max_num_tokens, self.hidden_size),
@@ -969,6 +986,10 @@ class FusedMoE(CustomOp):
     @property
     def use_deepep_ll_kernels(self):
         return self.moe_parallel_config.use_deepep_ll_kernels
+
+    @property
+    def use_mori_kernels(self):
+        return self.moe_parallel_config.use_mori_kernels
 
     @property
     def use_flashinfer_cutlass_kernels(self):
@@ -1549,7 +1570,7 @@ class FusedMoE(CustomOp):
         early.
         """
         return (self.use_pplx_kernels or self.use_deepep_ht_kernels
-                or self.use_deepep_ll_kernels)
+                or self.use_deepep_ll_kernels or self.use_mori_kernels)
 
     def maybe_all_reduce_tensor_model_parallel(
             self, final_hidden_states: torch.Tensor):
@@ -1557,7 +1578,7 @@ class FusedMoE(CustomOp):
         The pplx combine kernel reduces across GPU ranks by default.
         """
         if (self.use_pplx_kernels or self.use_deepep_ht_kernels
-                or self.use_deepep_ll_kernels):
+                or self.use_deepep_ll_kernels or self.use_mori_kernels):
             return final_hidden_states
         else:
             return tensor_model_parallel_all_reduce(final_hidden_states)
@@ -1666,12 +1687,14 @@ class FusedMoE(CustomOp):
             and self.moe_parallel_config.use_flashinfer_cutlass_kernels)
         if (self.moe_parallel_config.use_pplx_kernels
                 or self.moe_parallel_config.use_deepep_ll_kernels
+                or self.moe_parallel_config.use_mori_kernels
                 or use_flashinfer_cutlass_kernels):
             return self.forward_impl_chunked(hidden_states, router_logits)
 
         do_naive_dispatch_combine: bool = (
             self.dp_size > 1
             and not self.moe_parallel_config.use_deepep_ht_kernels
+            and not self.moe_parallel_config.use_mori_kernels
             and not self.moe_parallel_config.use_flashinfer_cutlass_kernels)
         if do_naive_dispatch_combine:
             hidden_states, router_logits = get_ep_group().dispatch(

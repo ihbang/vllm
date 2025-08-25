@@ -3350,6 +3350,12 @@ def has_triton_kernels() -> bool:
     return _has_module("triton_kernels")
 
 
+def has_mori() -> bool:
+    """Whether the optional `mori` package is available."""
+
+    return _has_module("mori")
+
+
 def set_process_title(name: str,
                       suffix: str = "",
                       append: bool = False) -> None:
