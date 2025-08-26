@@ -266,7 +266,6 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
 class MoriAll2AllManager(All2AllManagerBase):
     """
     All2All communication based on mori kernels.
-    Migration from DeepEP to mori for AMD GPU support.
     """
 
     def __init__(self, cpu_group):
@@ -301,70 +300,31 @@ class MoriAll2AllManager(All2AllManagerBase):
 
             logger.debug(f"[rank {self.rank}] PyTorch distributed ready with backend: {backend}")
 
-            # Try different initialization strategies
+            current_group = self.cpu_group if self.cpu_group is not None else dist.group.WORLD
+
+            # TODO(inhyeok): make group_name more reasonable
+            group_name = "default"
             try:
-                # Strategy 1: Try MPI-based initialization if available
+                import torch._C._distributed_c10d as c10d
+
+                # Try to unregister first in case it exists
                 try:
-                    logger.debug(f"[rank {self.rank}] Attempting MPI-based shmem initialization")
+                    c10d._unregister_process_group(group_name)
+                except:
+                    pass
 
-                    # Check if we're in an MPI environment
-                    import os
-                    if 'OMPI_COMM_WORLD_RANK' in os.environ or 'PMI_RANK' in os.environ or 'SLURM_PROCID' in os.environ:
-                        logger.debug(f"[rank {self.rank}] MPI environment detected, trying MPI initialization")
-                        mori.shmem.shmem_mpi_initialize()
-                        logger.debug(f"[rank {self.rank}] MPI shmem initialization successful")
-                        self._shmem_initialized = True
-                        return
-                    else:
-                        logger.debug(f"[rank {self.rank}] No MPI environment detected, skipping MPI initialization")
+                # Register the current process group
+                c10d._register_process_group(group_name, current_group)
+                logger.debug(f"[rank {self.rank}] Registered process group '{group_name}'")
 
-                except Exception as mpi_error:
-                    logger.debug(f"[rank {self.rank}] MPI shmem init failed: {mpi_error}")
+                # Initialize mori shmem with the registered group
+                mori.shmem.shmem_torch_process_group_init(group_name)
+                logger.debug(f"[rank {self.rank}] Torch process group shmem initialization successful")
+                self._shmem_initialized = True
+                return
 
-                # Strategy 2: Try PyTorch process group registration and initialization
-                current_group = self.cpu_group if self.cpu_group is not None else dist.group.WORLD
-
-                # Register the process group with a predictable name
-                group_name = "default"
-                try:
-                    import torch._C._distributed_c10d as c10d
-
-                    # Try to unregister first in case it exists
-                    try:
-                        c10d._unregister_process_group(group_name)
-                    except:
-                        pass
-
-                    # Register the current process group
-                    c10d._register_process_group(group_name, current_group)
-                    logger.debug(f"[rank {self.rank}] Registered process group '{group_name}'")
-
-                    # Initialize mori shmem with the registered group
-                    mori.shmem.shmem_torch_process_group_init(group_name)
-                    logger.debug(f"[rank {self.rank}] Torch process group shmem initialization successful")
-                    self._shmem_initialized = True
-                    return
-
-                except Exception as torch_error:
-                    logger.debug(f"[rank {self.rank}] Torch process group shmem init failed: {torch_error}")
-
-                # Strategy 3: Try with WORLD group directly
-                try:
-                    import torch._C._distributed_c10d as c10d
-                    c10d._register_process_group("world", dist.group.WORLD)
-                    mori.shmem.shmem_torch_process_group_init("world")
-                    logger.debug(f"[rank {self.rank}] WORLD group shmem initialization successful")
-                    self._shmem_initialized = True
-                    return
-                except Exception as world_error:
-                    logger.debug(f"[rank {self.rank}] WORLD group shmem init failed: {world_error}")
-
-                # If all strategies fail, log warning but continue
-                logger.warning(f"[rank {self.rank}] All shmem initialization strategies failed, continuing without shmem optimization")
-                logger.info(f"[rank {self.rank}] mori will use fallback communication without shmem acceleration")
-
-            except Exception as strategy_error:
-                logger.warning(f"[rank {self.rank}] shmem initialization strategies failed: {strategy_error}")
+            except Exception as torch_error:
+                logger.debug(f"[rank {self.rank}] Torch process group shmem init failed: {torch_error}")
 
             self._shmem_initialized = True
 
@@ -477,24 +437,10 @@ class MoriAll2AllManager(All2AllManagerBase):
 
     def dispatch(self, hidden_states: torch.Tensor,
                  router_logits: torch.Tensor):
-        """
-        NOTE: This method is not used in vLLM's modular kernel architecture.
-        Dispatch is handled by MoriPrepareAndFinalize.prepare().
-        """
-        raise NotImplementedError(
-            "MoriAll2AllManager.dispatch() should not be called directly. "
-            "Use MoriPrepareAndFinalize.prepare() instead."
-        )
+        raise NotImplementedError
 
     def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """
-        NOTE: This method is not used in vLLM's modular kernel architecture.
-        Combine is handled by MoriPrepareAndFinalize.finalize().
-        """
-        raise NotImplementedError(
-            "MoriAll2AllManager.combine() should not be called directly. "
-            "Use MoriPrepareAndFinalize.finalize() instead."
-        )
+        raise NotImplementedError
 
     def destroy(self):
         """Clean up mori resources"""

@@ -94,31 +94,27 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         return token_indices
 
-    def _prepare_scales(self, num_tokens: int, scale_dim: int = 0) -> torch.Tensor:
+    def _get_mori_config_params(self, input_tensor: torch.Tensor, scales: torch.Tensor) -> dict:
         """
-        Prepare scales tensor for mori dispatch.
+        Get mori configuration parameters based on actual tensor properties.
 
         Args:
-            num_tokens: Number of tokens
-            scale_dim: Scale dimension (0 for no quantization, > 0 for FP8)
+            input_tensor: Input tensor for dispatch
+            scales: Scales tensor (can be empty)
 
         Returns:
-            scales: Scales tensor with proper shape
+            dict: Configuration parameters for mori
         """
-        if scale_dim == 0:
-            # No quantization, return empty tensor like mori expects
-            return torch.empty(
-                (num_tokens, 0),
-                dtype=torch.float32,
-                device=torch.cuda.current_device(),
-            )
-        else:
-            # FP8 quantization enabled, create appropriate scales tensor
-            return torch.empty(
-                (num_tokens, scale_dim),
-                dtype=torch.float8_e4m3fnuz,  # mori uses this FP8 type
-                device=torch.cuda.current_device(),
-            )
+        config_params = {
+            'data_type': input_tensor.dtype,
+            'hidden_dim': input_tensor.size(-1),
+            'scale_dim': scales.size(-1) if scales.numel() > 0 else 0,
+            'scale_type_size': scales.element_size() if scales.numel() > 0 else 0,
+            'max_token_type_size': input_tensor.element_size(),
+        }
+        
+        logger.debug(f"Mori config params: {config_params}")
+        return config_params
 
     def prepare(
         self,
@@ -143,14 +139,10 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         Args:
             a1: Input hidden states [num_tokens, hidden_dim]
-            a1_scale: Input activation scales (unused for now)
-            a2_scale: Output activation scales (unused for now)
+            a1_scale: Input activation scales
             topk_weights: Top-k routing weights [num_tokens, experts_per_token]
             topk_ids: Top-k expert indices [num_tokens, experts_per_token]
-            num_experts: Total number of experts
-            expert_map: Expert mapping (unused)
-            apply_router_weight_on_input: Whether to apply weights on input (unused)
-            quant_config: Quantization config (unused for now)
+            quant_config: Quantization config
 
         Returns:
             Tuple of (dispatched_x, batched_scales, expert_tokens_meta, None, None)
@@ -161,25 +153,21 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         # Prepare inputs for mori dispatch
         token_indices = self._prepare_token_indices(topk_ids, experts_per_token)
-        weights = topk_weights.to(torch.float32)
-
-        # Prepare scales for mori dispatch based on quantization config
-        if quant_config.is_quantized and self.use_fp8_dispatch:
-            # FP8 quantization enabled - use scale_dim from mori config
-            scale_dim = 32  # mori default for FP8 quantization
-            if a1_scale is not None:
-                # Use provided quantization scales
-                scales = a1_scale.to(torch.float8_e4m3fnuz)
-                logger.debug(f"Using provided FP8 scales with shape: {scales.shape}")
-            else:
-                # Create default FP8 scales
-                scales = self._prepare_scales(num_tokens, scale_dim)
-                scales.fill_(1.0)  # Default scale value
-                logger.debug(f"Created default FP8 scales with shape: {scales.shape}")
+        
+        # Prepare scales for mori dispatch based on actual quantization state
+        if quant_config.is_quantized and self.use_fp8_dispatch and a1_scale is not None:
+            # Convert to FP8 type expected by mori (torch.float8_e4m3fnuz)
+            scales = a1_scale.to(torch.float8_e4m3fnuz) if a1_scale.dtype != torch.float8_e4m3fnuz else a1_scale
+            logger.debug(f"Using FP8 scales with shape: {scales.shape}, dtype: {scales.dtype}")
         else:
-            # No quantization - use empty scales tensor
-            scales = self._prepare_scales(num_tokens, scale_dim=0)
-            logger.debug(f"Using empty scales for non-quantized dispatch")
+            # No quantization or no scales provided
+            # Empty tensor shape: [num_tokens, 0] to match mori's expectation
+            scales = torch.empty(
+                (num_tokens, 0),
+                dtype=torch.float32,
+                device=a1.device,
+            )
+            logger.debug(f"Using empty scales tensor for non-quantized dispatch")
 
         try:
             # Perform mori dispatch
@@ -191,7 +179,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 dispatch_recv_num_token,
             ) = self.handle.dispatch(
                 input=a1,
-                weights=weights,
+                weights=topk_weights,
                 scales=scales,
                 indices=token_indices,
                 block_num=-1,  # Use default from config
@@ -208,18 +196,14 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 f"mori dispatch: received {total_recv_num_tokens} tokens"
             )
 
-            # Initialize expert token counts first (outside of if block to avoid UnboundLocalError)
+            # Initialize expert token counts
             expert_num_tokens = torch.zeros(self.num_local_experts,
-                                          dtype=torch.int32,
-                                          device=a1.device)
+                                            dtype=torch.int32,  # Required by mori C++ interface
+                                            device=a1.device)
 
             # Reshape dispatch output to BatchedExperts format: [num_local_experts, max_tokens_per_expert, hidden_dim]
-            # For now, we'll distribute tokens evenly across experts
-            # This is a simplified approach - a more sophisticated implementation would
-            # use the actual token distribution from mori dispatch
-
             if total_recv_num_tokens > 0:
-                # Calculate tokens per expert (simplified)
+                # Calculate tokens per expert
                 base_tokens_per_expert = total_recv_num_tokens // self.num_local_experts
                 remaining_tokens = total_recv_num_tokens % self.num_local_experts
 
@@ -256,12 +240,21 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
             # Create appropriate scales tensor based on quantization config
             if quant_config.is_quantized and self.use_fp8_dispatch:
-                # For FP8 quantized case, create proper scales tensor with appropriate shape
+                # For FP8 quantized case, use dispatch_scales dtype if available
                 scale_shape = quant_config.batched_scale_shape(
                     self.num_local_experts, self.max_num_tokens, hidden_dim)
+                
+                if dispatch_scales is not None and dispatch_scales.numel() > 0:
+                    scales_dtype = dispatch_scales.dtype
+                    logger.debug(f"Using dispatch_scales dtype: {scales_dtype}")
+                else:
+                    # Fall back to float32 (vLLM standard for scales)
+                    scales_dtype = torch.float32
+                    logger.debug(f"Using fallback dtype float32 for scales")
+                
                 batched_scales = torch.empty(scale_shape,
-                                           dtype=torch.float32,
-                                           device=a1.device)
+                                             dtype=scales_dtype,
+                                             device=a1.device)
 
                 # Use dispatch_scales from mori for proper FP8 quantization
                 if dispatch_scales is not None and dispatch_scales.numel() > 0:
@@ -269,14 +262,15 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                     if dispatch_scales.numel() == batched_scales.numel():
                         batched_scales.copy_(dispatch_scales.view(batched_scales.shape))
                     else:
-                        # Fall back to broadcasting or filling
+                        # Try to broadcast or fill with appropriate value
                         logger.warning(f"Scale shape mismatch: dispatch_scales {dispatch_scales.shape} vs batched_scales {batched_scales.shape}")
+                        # Fill with 1.0 converted to the correct dtype
                         batched_scales.fill_(1.0)
                 else:
-                    # No scales from dispatch, use default
+                    # No scales from dispatch, use default value in correct dtype
                     batched_scales.fill_(1.0)
 
-                logger.debug(f"Created FP8 scales tensor with shape: {scale_shape}")
+                logger.debug(f"Created FP8 scales tensor with shape: {scale_shape}, dtype: {scales_dtype}")
             else:
                 # For non-quantized case, return None
                 batched_scales = None
@@ -319,74 +313,87 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         Args:
             output: Output tensor to write results [num_original_tokens, hidden_dim]
-            fused_expert_output: Expert output activations [num_received_tokens, hidden_dim]
-            topk_weights: Original top-k weights (unused, we use cached dispatch weights)
-            topk_ids: Original top-k indices (unused, we use cached dispatch indices)
-            apply_router_weight_on_input: Whether weights applied on input (unused)
-            weight_and_reduce_impl: Weight and reduce implementation (unused for mori)
+            fused_expert_output: Expert output activations [varies by format]
+            topk_weights: Original top-k weights
+            topk_ids: Original top-k indices
         """
         if self._dispatch_cache is None:
             raise RuntimeError(
                 "No dispatch cache found. Must call prepare() first."
             )
 
-        # Get cached dispatch results
-        dispatch_weights = self._dispatch_cache["dispatch_weights"]
-        dispatch_indices = self._dispatch_cache["dispatch_indices"]
-        original_token_indices = self._dispatch_cache["original_token_indices"]
-        original_topk_ids = self._dispatch_cache["original_topk_ids"]
+        # Get minimal needed info from dispatch cache
         expert_num_tokens = self._dispatch_cache["expert_num_tokens"]
         total_recv_num_tokens = self._dispatch_cache["total_recv_num_tokens"]
+        num_original_tokens = output.size(0)  # Original number of tokens
 
         try:
-            # Convert BatchedExperts format back to 2D for mori combine
-            # fused_expert_output is [num_local_experts, max_tokens, hidden_dim]
+            # Convert BatchedExperts format to 2D if needed (following aiter's simpler approach)
             if fused_expert_output.dim() == 3:
+                # BatchedExperts format: [num_local_experts, max_tokens, hidden_dim]
+                # Convert to 2D by flattening only the used tokens
                 num_experts, max_tokens, hidden_dim = fused_expert_output.shape
-
-                # Use mori's registered buffer for efficient memory management
-                if self._combine_buffer is None:
-                    self._combine_buffer = self.handle.get_registered_input_buffer(fused_expert_output.dtype)
-
-                # Copy expert outputs to combine buffer efficiently
-                buffer_offset = 0
+                
+                # Collect only non-empty expert outputs
+                expert_outputs = []
+                actual_total_tokens = 0  # Track actual tokens being combined
                 for expert_idx in range(num_experts):
                     actual_tokens = int(expert_num_tokens[expert_idx].item())
                     if actual_tokens > 0:
                         expert_output = fused_expert_output[expert_idx, :actual_tokens, :]
-                        self._combine_buffer[buffer_offset:buffer_offset + actual_tokens, :].copy_(expert_output)
-                        buffer_offset += actual_tokens
-
-                # Use only the filled portion of the buffer
-                combine_input = self._combine_buffer[:buffer_offset, :] if buffer_offset > 0 else self._combine_buffer[:0, :]
+                        expert_outputs.append(expert_output)
+                        actual_total_tokens += actual_tokens
+                
+                if expert_outputs:
+                    combine_input = torch.cat(expert_outputs, dim=0)
+                else:
+                    # No tokens to process
+                    combine_input = torch.empty((0, hidden_dim), dtype=fused_expert_output.dtype, device=fused_expert_output.device)
+                    actual_total_tokens = 0
+                
+                # Validation: Check if tokens match what dispatch provided
+                if actual_total_tokens != total_recv_num_tokens:
+                    logger.warning(
+                        f"Token count mismatch: expert outputs contain {actual_total_tokens} tokens, "
+                        f"but dispatch provided {total_recv_num_tokens} tokens"
+                    )
             else:
                 # Already in 2D format - use directly
                 combine_input = fused_expert_output
+                actual_total_tokens = combine_input.size(0)
+                
+                # Validation for 2D case
+                if actual_total_tokens != total_recv_num_tokens:
+                    logger.warning(
+                        f"Token count mismatch in 2D format: input has {actual_total_tokens} tokens, "
+                        f"but dispatch provided {total_recv_num_tokens} tokens"
+                    )
 
-            # Perform mori combine - returns (output, weights) tuple
-            combined_output, combined_weights = self.handle.combine(
+            combined_output = self.handle.combine(
                 input=combine_input,
-                weights=dispatch_weights,
-                indices=original_token_indices,  # Use original indices from dispatch
-                block_num=-1,  # Use default from config
-                warp_per_block=-1,  # Use default from config
-                call_reset=True,  # Reset internal state after combine
+                weights=topk_weights,
+                indices=topk_ids,
+                block_num=-1,          # Use default from config
+                warp_per_block=-1,     # Use default from config
+                call_reset=True,       # Reset internal state after combine
             )
 
-            logger.debug(f"mori combine: output shape {combined_output.shape}")
+            logger.debug(
+                f"mori combine: output shape {combined_output.shape}, "
+                f"processed {actual_total_tokens} tokens from {total_recv_num_tokens} received"
+            )
 
-            # Copy combined result to output tensor
-            # Trim to original number of tokens if needed
-            num_original_tokens = original_topk_ids.size(0)
+            # Copy result to output tensor, trimmed to original size
             if combined_output.size(0) >= num_original_tokens:
                 output.copy_(combined_output[:num_original_tokens])
             else:
-                # This shouldn't happen, but handle gracefully
+                # Handle edge case gracefully
                 logger.warning(
-                    f"Combined output has fewer tokens than expected: "
+                    f"Combined output smaller than expected: "
                     f"{combined_output.size(0)} < {num_original_tokens}"
                 )
-                output[: combined_output.size(0)].copy_(combined_output)
+                output[:combined_output.size(0)].copy_(combined_output)
+                output[combined_output.size(0):].zero_()  # Zero remaining
 
             # Clear cache
             self._dispatch_cache = None

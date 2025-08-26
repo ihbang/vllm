@@ -35,8 +35,8 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
-from vllm.utils import (direct_register_custom_op, has_deep_ep, has_mori, has_pplx,
-                        round_up)
+from vllm.utils import (direct_register_custom_op, has_deep_ep, has_mori,
+                        has_pplx, round_up)
 
 if current_platform.is_cuda_alike():
     from .fused_batched_moe import BatchedTritonExperts
@@ -197,10 +197,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             )
             handle = all2all_manager.get_handle(all_to_all_args)
 
-            # Check if FP8 quantization should be used for mori dispatch
-            # mori uses torch.float8_e4m3fnuz for FP8 quantization
-            use_fp8_dispatch = (moe.quant_config.is_quantized and
-                              moe.quant_config.quant_dtype in [torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz])
+            use_fp8_dispatch = (moe.quant_config is not None
+                                and moe.quant_config.quant_dtype
+                                == current_platform.fp8_dtype())
 
             prepare_finalize = MoriPrepareAndFinalize(
                 handle,
