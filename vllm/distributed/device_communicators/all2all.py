@@ -478,152 +478,23 @@ class MoriAll2AllManager(All2AllManagerBase):
     def dispatch(self, hidden_states: torch.Tensor,
                  router_logits: torch.Tensor):
         """
-        Dispatch tokens to appropriate experts using mori kernels.
-
-        Args:
-            hidden_states: Input token embeddings [num_tokens, hidden_dim]
-            router_logits: Router outputs [num_tokens, num_global_experts]
-
-        Returns:
-            Tuple of (dispatched_hidden_states, dispatched_router_logits)
+        NOTE: This method is not used in vLLM's modular kernel architecture.
+        Dispatch is handled by MoriPrepareAndFinalize.prepare().
         """
-        # Get forward context for metadata
-        forward_ctx = get_forward_context()
-        dp_metadata = forward_ctx.dp_metadata
-
-        # Get handle from cache
-        handle = self.get_handle({
-            'max_num_tokens': dp_metadata.max_num_tokens_per_dp_rank,
-            'num_local_experts': dp_metadata.num_local_experts,
-            'experts_per_token': dp_metadata.num_experts_per_token,
-            'hidden_dim': hidden_states.size(-1),
-            'data_type': hidden_states.dtype
-        })
-
-        # Prepare token indices from router logits
-        # This converts router logits to expert indices for each token
-        token_indices = self._prepare_token_indices(
-            router_logits, dp_metadata.num_experts_per_token
+        raise NotImplementedError(
+            "MoriAll2AllManager.dispatch() should not be called directly. "
+            "Use MoriPrepareAndFinalize.prepare() instead."
         )
-
-        # Prepare weights from router logits
-        weights = self._prepare_weights(
-            router_logits, dp_metadata.num_experts_per_token
-        )
-
-        # Prepare scales (empty for now, no FP8 quantization)
-        scales = torch.empty((hidden_states.size(0), 0),
-                           dtype=torch.float32,
-                           device=hidden_states.device)
-
-        try:
-            # Perform mori dispatch
-            dispatch_output, dispatch_weights, dispatch_scales, \
-            dispatch_indices, dispatch_recv_num_token = handle.dispatch(
-                input=hidden_states,
-                weights=weights,
-                scales=scales,
-                indices=token_indices,
-                block_num=-1,  # Use default
-                warp_per_block=-1  # Use default
-            )
-
-            # Store dispatch results in forward context for combine phase
-            forward_ctx.mori_dispatch_cache = {
-                'dispatch_output': dispatch_output,
-                'dispatch_weights': dispatch_weights,
-                'dispatch_indices': dispatch_indices,
-                'handle': handle,
-                'num_received_tokens': dispatch_recv_num_token
-            }
-
-            logger.debug(f"[rank {self.dp_rank}] dispatch completed, "
-                        f"received {dispatch_recv_num_token[0] if dispatch_recv_num_token.numel() > 0 else 0} tokens")
-
-            return dispatch_output, self._reconstruct_router_logits(
-                dispatch_weights, dispatch_indices)
-
-        except Exception as e:
-            logger.error(f"[rank {self.dp_rank}] mori dispatch failed: {e}")
-            raise
 
     def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
-        Combine expert outputs back to original token order using mori kernels.
-
-        Args:
-            hidden_states: Expert outputs [num_received_tokens, hidden_dim]
-
-        Returns:
-            Combined hidden states [num_local_tokens, hidden_dim]
+        NOTE: This method is not used in vLLM's modular kernel architecture.
+        Combine is handled by MoriPrepareAndFinalize.finalize().
         """
-        # Get cached dispatch results from forward context
-        forward_ctx = get_forward_context()
-        if not hasattr(forward_ctx, 'mori_dispatch_cache'):
-            raise RuntimeError("No mori dispatch cache found. Must call dispatch() first.")
-
-        cache = forward_ctx.mori_dispatch_cache
-        handle = cache['handle']
-        dispatch_weights = cache['dispatch_weights']
-        dispatch_indices = cache['dispatch_indices']
-
-        try:
-            # Perform mori combine
-            combined_output, combined_weights = handle.combine(
-                input=hidden_states,
-                weights=dispatch_weights,
-                indices=dispatch_indices,
-                block_num=-1,  # Use default
-                warp_per_block=-1  # Use default
-            )
-
-            logger.debug(f"[rank {self.dp_rank}] combine completed")
-
-            # Clean up cache
-            delattr(forward_ctx, 'mori_dispatch_cache')
-
-            return combined_output
-
-        except Exception as e:
-            logger.error(f"[rank {self.dp_rank}] mori combine failed: {e}")
-            raise
-
-    def _prepare_token_indices(self, router_logits: torch.Tensor,
-                              experts_per_token: int) -> torch.Tensor:
-        """Convert router logits to token indices for mori"""
-        num_tokens = router_logits.size(0)
-        num_global_experts = router_logits.size(1)
-
-        # Get top-k expert indices
-        topk_logits, topk_indices = torch.topk(
-            router_logits, experts_per_token, dim=-1
+        raise NotImplementedError(
+            "MoriAll2AllManager.combine() should not be called directly. "
+            "Use MoriPrepareAndFinalize.finalize() instead."
         )
-
-        # Convert global expert indices to local expert indices within DP rank
-        num_experts_per_rank = num_global_experts // self.dp_world_size
-        local_expert_indices = topk_indices % num_experts_per_rank
-
-        # Flatten for mori format: [num_tokens * experts_per_token]
-        token_indices = local_expert_indices.view(-1).to(torch.int32)
-
-        return token_indices
-
-    def _prepare_weights(self, router_logits: torch.Tensor,
-                        experts_per_token: int) -> torch.Tensor:
-        """Extract top-k weights from router logits"""
-        topk_logits, _ = torch.topk(router_logits, experts_per_token, dim=-1)
-
-        # Apply softmax to get routing weights
-        routing_weights = torch.softmax(topk_logits, dim=-1)
-
-        return routing_weights.to(torch.float32)
-
-    def _reconstruct_router_logits(self, weights: torch.Tensor,
-                                  indices: torch.Tensor) -> torch.Tensor:
-        """Reconstruct router logits from dispatched weights and indices"""
-        # For now, just return the weights - this may need refinement
-        # based on how vllm uses the returned router logits
-        return weights
 
     def destroy(self):
         """Clean up mori resources"""

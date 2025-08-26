@@ -196,11 +196,18 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 hidden_dim=moe.hidden_dim,
             )
             handle = all2all_manager.get_handle(all_to_all_args)
+
+            # Check if FP8 quantization should be used for mori dispatch
+            # mori uses torch.float8_e4m3fnuz for FP8 quantization
+            use_fp8_dispatch = (moe.quant_config.is_quantized and
+                              moe.quant_config.quant_dtype in [torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz])
+
             prepare_finalize = MoriPrepareAndFinalize(
                 handle,
                 max_num_tokens=moe.max_num_tokens,
                 num_local_experts=moe.num_local_experts,
                 num_dispatchers=all2all_manager.world_size,
+                use_fp8_dispatch=use_fp8_dispatch,
             )
 
         return prepare_finalize
