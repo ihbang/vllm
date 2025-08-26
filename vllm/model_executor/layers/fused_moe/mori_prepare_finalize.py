@@ -158,7 +158,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if quant_config.is_quantized and self.use_fp8_dispatch and a1_scale is not None:
             # Convert to FP8 type expected by mori (torch.float8_e4m3fnuz)
             scales = a1_scale.to(torch.float8_e4m3fnuz) if a1_scale.dtype != torch.float8_e4m3fnuz else a1_scale
-            logger.debug(f"Using FP8 scales with shape: {scales.shape}, dtype: {scales.dtype}")
         else:
             # No quantization or no scales provided
             # Empty tensor shape: [num_tokens, 0] to match mori's expectation
@@ -167,7 +166,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 dtype=torch.float32,
                 device=a1.device,
             )
-            logger.debug(f"Using empty scales tensor for non-quantized dispatch")
 
         try:
             # Perform mori dispatch
@@ -190,10 +188,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 dispatch_recv_num_token[0].item()
                 if dispatch_recv_num_token.numel() > 0
                 else 0
-            )
-
-            logger.debug(
-                f"mori dispatch: received {total_recv_num_tokens} tokens"
             )
 
             # Initialize expert token counts
@@ -244,13 +238,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 scale_shape = quant_config.batched_scale_shape(
                     self.num_local_experts, self.max_num_tokens, hidden_dim)
                 
-                if dispatch_scales is not None and dispatch_scales.numel() > 0:
-                    scales_dtype = dispatch_scales.dtype
-                    logger.debug(f"Using dispatch_scales dtype: {scales_dtype}")
-                else:
-                    # Fall back to float32 (vLLM standard for scales)
-                    scales_dtype = torch.float32
-                    logger.debug(f"Using fallback dtype float32 for scales")
+                scales_dtype = dispatch_scales.dtype if (dispatch_scales is not None and dispatch_scales.numel() > 0) else torch.float32
                 
                 batched_scales = torch.empty(scale_shape,
                                              dtype=scales_dtype,
@@ -269,8 +257,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 else:
                     # No scales from dispatch, use default value in correct dtype
                     batched_scales.fill_(1.0)
-
-                logger.debug(f"Created FP8 scales tensor with shape: {scale_shape}, dtype: {scales_dtype}")
             else:
                 # For non-quantized case, return None
                 batched_scales = None
@@ -324,7 +310,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         # Get minimal needed info from dispatch cache
         expert_num_tokens = self._dispatch_cache["expert_num_tokens"]
-        total_recv_num_tokens = self._dispatch_cache["total_recv_num_tokens"]
         num_original_tokens = output.size(0)  # Original number of tokens
 
         try:
@@ -334,40 +319,18 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 # Convert to 2D by flattening only the used tokens
                 num_experts, max_tokens, hidden_dim = fused_expert_output.shape
                 
-                # Collect only non-empty expert outputs
                 expert_outputs = []
-                actual_total_tokens = 0  # Track actual tokens being combined
                 for expert_idx in range(num_experts):
                     actual_tokens = int(expert_num_tokens[expert_idx].item())
                     if actual_tokens > 0:
                         expert_output = fused_expert_output[expert_idx, :actual_tokens, :]
                         expert_outputs.append(expert_output)
-                        actual_total_tokens += actual_tokens
                 
-                if expert_outputs:
-                    combine_input = torch.cat(expert_outputs, dim=0)
-                else:
-                    # No tokens to process
-                    combine_input = torch.empty((0, hidden_dim), dtype=fused_expert_output.dtype, device=fused_expert_output.device)
-                    actual_total_tokens = 0
-                
-                # Validation: Check if tokens match what dispatch provided
-                if actual_total_tokens != total_recv_num_tokens:
-                    logger.warning(
-                        f"Token count mismatch: expert outputs contain {actual_total_tokens} tokens, "
-                        f"but dispatch provided {total_recv_num_tokens} tokens"
-                    )
+                combine_input = torch.cat(expert_outputs, dim=0) if expert_outputs else torch.empty(
+                    (0, hidden_dim), dtype=fused_expert_output.dtype, device=fused_expert_output.device
+                )
             else:
-                # Already in 2D format - use directly
                 combine_input = fused_expert_output
-                actual_total_tokens = combine_input.size(0)
-                
-                # Validation for 2D case
-                if actual_total_tokens != total_recv_num_tokens:
-                    logger.warning(
-                        f"Token count mismatch in 2D format: input has {actual_total_tokens} tokens, "
-                        f"but dispatch provided {total_recv_num_tokens} tokens"
-                    )
 
             combined_output = self.handle.combine(
                 input=combine_input,
@@ -376,11 +339,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 block_num=-1,          # Use default from config
                 warp_per_block=-1,     # Use default from config
                 call_reset=True,       # Reset internal state after combine
-            )
-
-            logger.debug(
-                f"mori combine: output shape {combined_output.shape}, "
-                f"processed {actual_total_tokens} tokens from {total_recv_num_tokens} received"
             )
 
             # Copy result to output tensor, trimmed to original size
