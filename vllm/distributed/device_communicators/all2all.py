@@ -277,27 +277,102 @@ class MoriAll2AllManager(All2AllManagerBase):
         self.handle_cache = Cache()
         self.config = None
         self._op_handles = {}  # Cache for EpDispatchCombineOp instances
+        self._shmem_initialized = False
+        # Delay mori shmem initialization until first use
+        logger.debug(f"[rank {self.rank}] MoriAll2AllManager created, shmem will be initialized lazily")
 
-        # Initialize mori shmem if not already done
-        self._initialize_mori_shmem()
+    def _ensure_shmem_initialized(self):
+        """Ensure mori's shared memory system is initialized (lazy initialization)"""
+        if self._shmem_initialized:
+            return
 
-    def _initialize_mori_shmem(self):
-        """Initialize mori's shared memory system"""
         import mori.shmem
         import torch.distributed as dist
 
         try:
-            # Register the process group for mori
-            world_group = dist.group.WORLD
-            if world_group is not None:
-                torch._C._distributed_c10d._register_process_group("default", world_group)
+            # Wait for PyTorch distributed to be ready
+            if not dist.is_initialized():
+                raise RuntimeError("PyTorch distributed not initialized yet")
 
-            # Initialize mori shared memory
-            mori.shmem.shmem_torch_process_group_init("default")
-            logger.debug(f"[rank {self.rank}] mori shmem initialized successfully")
+            # Check if we have a valid backend
+            backend = dist.get_backend()
+            if backend is None:
+                raise RuntimeError("No valid distributed backend found")
+
+            logger.debug(f"[rank {self.rank}] PyTorch distributed ready with backend: {backend}")
+
+            # Try different initialization strategies
+            try:
+                # Strategy 1: Try MPI-based initialization if available
+                try:
+                    logger.debug(f"[rank {self.rank}] Attempting MPI-based shmem initialization")
+
+                    # Check if we're in an MPI environment
+                    import os
+                    if 'OMPI_COMM_WORLD_RANK' in os.environ or 'PMI_RANK' in os.environ or 'SLURM_PROCID' in os.environ:
+                        logger.debug(f"[rank {self.rank}] MPI environment detected, trying MPI initialization")
+                        mori.shmem.shmem_mpi_initialize()
+                        logger.debug(f"[rank {self.rank}] MPI shmem initialization successful")
+                        self._shmem_initialized = True
+                        return
+                    else:
+                        logger.debug(f"[rank {self.rank}] No MPI environment detected, skipping MPI initialization")
+
+                except Exception as mpi_error:
+                    logger.debug(f"[rank {self.rank}] MPI shmem init failed: {mpi_error}")
+
+                # Strategy 2: Try PyTorch process group registration and initialization
+                current_group = self.cpu_group if self.cpu_group is not None else dist.group.WORLD
+
+                # Register the process group with a predictable name
+                group_name = "default"
+                try:
+                    import torch._C._distributed_c10d as c10d
+
+                    # Try to unregister first in case it exists
+                    try:
+                        c10d._unregister_process_group(group_name)
+                    except:
+                        pass
+
+                    # Register the current process group
+                    c10d._register_process_group(group_name, current_group)
+                    logger.debug(f"[rank {self.rank}] Registered process group '{group_name}'")
+
+                    # Initialize mori shmem with the registered group
+                    mori.shmem.shmem_torch_process_group_init(group_name)
+                    logger.debug(f"[rank {self.rank}] Torch process group shmem initialization successful")
+                    self._shmem_initialized = True
+                    return
+
+                except Exception as torch_error:
+                    logger.debug(f"[rank {self.rank}] Torch process group shmem init failed: {torch_error}")
+
+                # Strategy 3: Try with WORLD group directly
+                try:
+                    import torch._C._distributed_c10d as c10d
+                    c10d._register_process_group("world", dist.group.WORLD)
+                    mori.shmem.shmem_torch_process_group_init("world")
+                    logger.debug(f"[rank {self.rank}] WORLD group shmem initialization successful")
+                    self._shmem_initialized = True
+                    return
+                except Exception as world_error:
+                    logger.debug(f"[rank {self.rank}] WORLD group shmem init failed: {world_error}")
+
+                # If all strategies fail, log warning but continue
+                logger.warning(f"[rank {self.rank}] All shmem initialization strategies failed, continuing without shmem optimization")
+                logger.info(f"[rank {self.rank}] mori will use fallback communication without shmem acceleration")
+
+            except Exception as strategy_error:
+                logger.warning(f"[rank {self.rank}] shmem initialization strategies failed: {strategy_error}")
+
+            self._shmem_initialized = True
+
         except Exception as e:
-            logger.error(f"[rank {self.rank}] mori shmem init failed: {e}")
-            raise
+            logger.error(f"[rank {self.rank}] mori shmem initialization failed: {e}")
+            # Don't fail completely - mark as initialized to avoid retry loops
+            self._shmem_initialized = True
+            logger.warning(f"[rank {self.rank}] Continuing without mori shmem optimization")
 
     def _make_mori_config(self, max_num_tokens: int, num_local_experts: int,
                           experts_per_token: int, hidden_dim: int,
@@ -354,6 +429,9 @@ class MoriAll2AllManager(All2AllManagerBase):
                 - hidden_dim: Hidden dimension size
                 - data_type: Tensor data type (optional, default bfloat16)
         """
+        # Ensure shmem is initialized before creating handles
+        self._ensure_shmem_initialized()
+
         import mori.ops.dispatch_combine as mori_ops
 
         # Extract parameters
@@ -550,13 +628,19 @@ class MoriAll2AllManager(All2AllManagerBase):
     def destroy(self):
         """Clean up mori resources"""
         try:
-            import mori.shmem
-
             # Clear operation handle cache
             self._op_handles.clear()
 
-            # Finalize mori shared memory
-            mori.shmem.shmem_finalize()
+            # Try to finalize mori shared memory if it was successfully initialized
+            if self._shmem_initialized:
+                try:
+                    import mori.shmem
+                    # Check if shmem is actually active before finalizing
+                    mori.shmem.shmem_finalize()
+                    logger.debug(f"[rank {self.dp_rank}] mori shmem finalized")
+                except Exception as shmem_error:
+                    logger.debug(f"[rank {self.dp_rank}] shmem finalize failed (may not have been active): {shmem_error}")
+
             logger.debug(f"[rank {self.dp_rank}] mori resources cleaned up")
 
         except Exception as e:

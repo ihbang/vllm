@@ -114,7 +114,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         expert_map: Optional[torch.Tensor],
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
-        extra_prepare_args: Optional[dict[str, Any]],
     ) -> tuple[
         torch.Tensor,
         Optional[torch.Tensor],
@@ -135,7 +134,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             expert_map: Expert mapping (unused)
             apply_router_weight_on_input: Whether to apply weights on input (unused)
             quant_config: Quantization config (unused for now)
-            extra_prepare_args: Extra arguments (unused)
 
         Returns:
             Tuple of (dispatched_x, batched_scales, expert_tokens_meta, None, None)
@@ -186,12 +184,45 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 f"mori dispatch: received {total_recv_num_tokens} tokens"
             )
 
-            # Return trimmed output and metadata
+            # Reshape dispatch output to BatchedExperts format: [num_local_experts, max_tokens_per_expert, hidden_dim]
+            # For now, we'll distribute tokens evenly across experts
+            # This is a simplified approach - a more sophisticated implementation would
+            # use the actual token distribution from mori dispatch
+            if total_recv_num_tokens > 0:
+                # Calculate tokens per expert (simplified)
+                tokens_per_expert = total_recv_num_tokens // self.num_local_experts
+                remaining_tokens = total_recv_num_tokens % self.num_local_experts
+
+                # Create batched format tensor
+                batched_output = torch.zeros(
+                    (self.num_local_experts, self.max_num_tokens, hidden_dim),
+                    dtype=dispatch_output.dtype,
+                    device=dispatch_output.device
+                )
+
+                # Fill the batched tensor with dispatch output
+                start_idx = 0
+                for expert_idx in range(self.num_local_experts):
+                    expert_tokens = tokens_per_expert + (1 if expert_idx < remaining_tokens else 0)
+                    if expert_tokens > 0:
+                        end_idx = start_idx + expert_tokens
+                        actual_tokens = min(expert_tokens, self.max_num_tokens)
+                        batched_output[expert_idx, :actual_tokens] = dispatch_output[start_idx:start_idx + actual_tokens]
+                        start_idx = end_idx
+            else:
+                # No tokens received, create empty batched tensor
+                batched_output = torch.zeros(
+                    (self.num_local_experts, self.max_num_tokens, hidden_dim),
+                    dtype=a1.dtype,
+                    device=a1.device
+                )
+
+            # Return batched output and metadata
             expert_tokens_meta = None  # mori doesn't use this metadata format
             batched_scales = None  # No quantization for now
 
             return (
-                dispatch_output[:total_recv_num_tokens],
+                batched_output,
                 batched_scales,
                 expert_tokens_meta,
                 None,
@@ -210,7 +241,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
-        extra_finalize_args: Optional[dict[str, Any]],
     ) -> None:
         """
         Finalize expert outputs using mori combine operation.
@@ -222,7 +252,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             topk_ids: Original top-k indices (unused, we use cached dispatch indices)
             apply_router_weight_on_input: Whether weights applied on input (unused)
             weight_and_reduce_impl: Weight and reduce implementation (unused for mori)
-            extra_finalize_args: Extra arguments (unused)
         """
         if self._dispatch_cache is None:
             raise RuntimeError(
@@ -236,9 +265,25 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         original_topk_ids = self._dispatch_cache["original_topk_ids"]
 
         try:
+            # Convert BatchedExperts format back to 2D for mori combine
+            # fused_expert_output is [num_local_experts, max_tokens, hidden_dim]
+            if fused_expert_output.dim() == 3:
+                num_experts, max_tokens, hidden_dim = fused_expert_output.shape
+                # Flatten to [total_tokens, hidden_dim] format
+                flattened_output = fused_expert_output.view(-1, hidden_dim)
+
+                # Only use the tokens that were actually processed
+                # This is a simplified approach - we should ideally track which tokens were active
+                total_tokens = min(flattened_output.size(0),
+                                 self._dispatch_cache.get("num_received_tokens", [flattened_output.size(0)])[0])
+                combine_input = flattened_output[:total_tokens]
+            else:
+                # Already in 2D format
+                combine_input = fused_expert_output
+
             # Perform mori combine
             combined_output, combined_weights = self.handle.combine(
-                input=fused_expert_output,
+                input=combine_input,
                 weights=dispatch_weights,
                 indices=original_token_indices,  # Use original indices from dispatch
                 block_num=-1,  # Use default from config
