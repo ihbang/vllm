@@ -53,12 +53,8 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.num_dispatchers_ = num_dispatchers
         self.use_fp8_dispatch = use_fp8_dispatch
 
-        # Storage for dispatch results that finalize needs
-        self._dispatch_cache = None
-
-        # Get registered input buffer for memory efficiency (lazy initialization)
-        self._input_buffer = None
-        self._combine_buffer = None
+        # Minimal storage for finalize (memory optimized)
+        self._expert_num_tokens = None  # Only store what we need
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -201,9 +197,11 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 base_tokens_per_expert = total_recv_num_tokens // self.num_local_experts
                 remaining_tokens = total_recv_num_tokens % self.num_local_experts
 
-                # Create batched format tensor
+                actual_max_tokens = min(self.max_num_tokens, 
+                                      max(base_tokens_per_expert + (1 if remaining_tokens > 0 else 0), 1))
+                
                 batched_output = torch.zeros(
-                    (self.num_local_experts, self.max_num_tokens, hidden_dim),
+                    (self.num_local_experts, actual_max_tokens, hidden_dim),
                     dtype=dispatch_output.dtype,
                     device=dispatch_output.device
                 )
@@ -214,14 +212,15 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                     expert_tokens = base_tokens_per_expert + (1 if expert_idx < remaining_tokens else 0)
                     if expert_tokens > 0:
                         end_idx = start_idx + expert_tokens
-                        actual_tokens = min(expert_tokens, self.max_num_tokens)
-                        batched_output[expert_idx, :actual_tokens] = dispatch_output[start_idx:start_idx + actual_tokens]
+                        actual_tokens = min(expert_tokens, actual_max_tokens)
+                        if actual_tokens > 0:
+                            batched_output[expert_idx, :actual_tokens] = dispatch_output[start_idx:start_idx + actual_tokens]
                         expert_num_tokens[expert_idx] = actual_tokens
                         start_idx = end_idx
             else:
-                # No tokens received, create empty batched tensor
+                # No tokens received, create minimal empty tensor
                 batched_output = torch.zeros(
-                    (self.num_local_experts, self.max_num_tokens, hidden_dim),
+                    (self.num_local_experts, 1, hidden_dim),
                     dtype=a1.dtype,
                     device=a1.device
                 )
@@ -235,8 +234,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             # Create appropriate scales tensor based on quantization config
             if quant_config.is_quantized and self.use_fp8_dispatch:
                 # For FP8 quantized case, use dispatch_scales dtype if available
+                actual_tokens_dim = batched_output.size(1)
                 scale_shape = quant_config.batched_scale_shape(
-                    self.num_local_experts, self.max_num_tokens, hidden_dim)
+                    self.num_local_experts, actual_tokens_dim, hidden_dim)
                 
                 scales_dtype = dispatch_scales.dtype if (dispatch_scales is not None and dispatch_scales.numel() > 0) else torch.float32
                 
@@ -261,17 +261,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 # For non-quantized case, return None
                 batched_scales = None
 
-            # Cache dispatch results for finalize phase (after expert_num_tokens is defined)
-            self._dispatch_cache = {
-                "dispatch_weights": dispatch_weights,
-                "dispatch_indices": dispatch_indices,
-                "original_token_indices": token_indices,
-                "num_received_tokens": dispatch_recv_num_token,
-                "original_topk_ids": topk_ids,
-                "original_topk_weights": topk_weights,
-                "expert_num_tokens": expert_num_tokens,
-                "total_recv_num_tokens": total_recv_num_tokens,
-            }
+            self._expert_num_tokens = expert_num_tokens
 
             return (
                 batched_output,
@@ -303,13 +293,12 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             topk_weights: Original top-k weights
             topk_ids: Original top-k indices
         """
-        if self._dispatch_cache is None:
+        if self._expert_num_tokens is None:
             raise RuntimeError(
-                "No dispatch cache found. Must call prepare() first."
+                "No expert token data found. Must call prepare() first."
             )
 
-        # Get minimal needed info from dispatch cache
-        expert_num_tokens = self._dispatch_cache["expert_num_tokens"]
+        expert_num_tokens = self._expert_num_tokens
         num_original_tokens = output.size(0)  # Original number of tokens
 
         try:
@@ -353,8 +342,8 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 output[:combined_output.size(0)].copy_(combined_output)
                 output[combined_output.size(0):].zero_()  # Zero remaining
 
-            # Clear cache
-            self._dispatch_cache = None
+            # Clear cached data
+            self._expert_num_tokens = None
 
         except Exception as e:
             logger.error(f"mori combine failed: {e}")
