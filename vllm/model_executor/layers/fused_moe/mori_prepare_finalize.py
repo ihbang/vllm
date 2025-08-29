@@ -193,19 +193,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         num_original_tokens = output.size(0)  # Original number of tokens
 
         try:
-            # fused_expert_output can have 0 tokens - This happens when none of the
-            # tokens from the all2all reach this EP rank.
-            if fused_expert_output.numel() != 0:
-                if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
-                    weight_and_reduce_impl = TopKWeightAndReduceContiguous()
-                fused_expert_output = weight_and_reduce_impl.apply(
-                    output=None,
-                    fused_expert_output=fused_expert_output,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                    apply_router_weight_on_input=apply_router_weight_on_input,
-                )
-
             combined_output, combined_weights = self.handle.combine(
                 input=fused_expert_output,
                 weights=topk_weights,
