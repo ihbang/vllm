@@ -44,6 +44,7 @@ if HAS_TRITON:
     # import to register the custom ops
     import vllm.model_executor.layers.fused_moe.fused_marlin_moe  # noqa
     import vllm.model_executor.layers.fused_moe.fused_moe  # noqa
+    from vllm.model_executor.layers.fused_moe.aiter_experts import AiterExperts
     from vllm.model_executor.layers.fused_moe.batched_deep_gemm_moe import (
         BatchedDeepGemmExperts)
     from vllm.model_executor.layers.fused_moe.batched_triton_or_deep_gemm_moe import (  # noqa: E501
@@ -77,4 +78,5 @@ if HAS_TRITON:
         "BatchedDeepGemmExperts",
         "TritonOrDeepGemmExperts",
         "BatchedTritonOrDeepGemmExperts",
+        "AiterExperts",
     ]

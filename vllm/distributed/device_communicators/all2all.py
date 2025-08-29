@@ -336,6 +336,7 @@ class MoriAll2AllManager(All2AllManagerBase):
 
     def _make_mori_config(self, max_num_tokens: int, num_local_experts: int,
                           experts_per_token: int, hidden_dim: int,
+                          scale_dim: int, scale_type_size: int,
                           data_type: torch.dtype = torch.bfloat16):
         """Create mori EpDispatchCombineConfig"""
         import mori.ops.dispatch_combine as mori_ops
@@ -351,25 +352,23 @@ class MoriAll2AllManager(All2AllManagerBase):
 
         config = mori_ops.EpDispatchCombineConfig(
             data_type=data_type,
-            rank=self.dp_rank,  # Use dp_rank for expert parallelism
-            world_size=self.dp_world_size,
+            rank=self.rank,
+            world_size=self.world_size,
             hidden_dim=hidden_dim,
             max_num_inp_token_per_rank=max_num_tokens,
             num_experts_per_rank=num_local_experts,
             num_experts_per_token=experts_per_token,
 
             # Performance tuning parameters (can be optimized later)
-            warp_num_per_block=8,  # Good default for MI300X
-            block_num=80,          # Good default for MI300X
+            #warp_num_per_block=8,  # Good default for MI300X
+            #block_num=80,          # Good default for MI300X
             max_token_type_size=max_token_type_size,
 
             # Quantization support (disabled for now)
-            scale_dim=0,
-            scale_type_size=0,
+            scale_dim=scale_dim,
+            scale_type_size=scale_type_size,
 
-            # Use internal buffer management
             use_external_inp_buf=False,
-
             # Determine kernel type based on topology
             kernel_type=(EpDispatchCombineKernelType.InterNode
                         if self.internode
@@ -400,6 +399,8 @@ class MoriAll2AllManager(All2AllManagerBase):
         experts_per_token = kwargs.get('experts_per_token')
         hidden_dim = kwargs.get('hidden_dim')
         data_type = kwargs.get('data_type', torch.bfloat16)
+        scale_dim = kwargs.get('scale_dim')
+        scale_type_size = kwargs.get('scale_type_size')
 
         # Validate required parameters
         if any(param is None for param in [max_num_tokens, num_local_experts,
@@ -420,7 +421,9 @@ class MoriAll2AllManager(All2AllManagerBase):
             num_local_experts=num_local_experts,
             experts_per_token=experts_per_token,
             hidden_dim=hidden_dim,
-            data_type=data_type
+            data_type=data_type,
+            scale_dim=scale_dim,
+            scale_type_size=scale_type_size,
         )
 
         # Create operation handle

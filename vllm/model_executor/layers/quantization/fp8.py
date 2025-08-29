@@ -17,6 +17,8 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoE, FusedMoEActivationFormat, FusedMoEConfig, FusedMoEMethodBase,
     FusedMoEPermuteExpertsUnpermute, FusedMoEPrepareAndFinalize,
     FusedMoeWeightScaleSupported)
+from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
+    is_rocm_aiter_moe_enabled)
 from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -684,7 +686,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         # Lazy import to avoid importing triton too early.
         from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
-            is_rocm_aiter_moe_enabled, shuffle_weights)
+            shuffle_weights)
 
         self.rocm_aiter_moe_enabled = is_rocm_aiter_moe_enabled()
 
@@ -899,12 +901,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         moe: FusedMoEConfig,
     ) -> FusedMoEPermuteExpertsUnpermute:
         from vllm.model_executor.layers.fused_moe import (
-            BatchedTritonOrDeepGemmExperts, TritonOrDeepGemmExperts)
+            AiterExperts, BatchedTritonOrDeepGemmExperts, TritonOrDeepGemmExperts)
 
         assert not self.use_marlin, (
             "Marlin is not supported with all2all yet.")
 
-        if (prepare_finalize.activation_format ==
+        if moe.use_mori_kernels and is_rocm_aiter_moe_enabled():
+            logger.debug("AiterExperts for Mori integration %s", self.moe)
+            return AiterExperts(
+                max_num_tokens=self.moe.max_num_tokens,
+                use_fp8_w8a8=True,
+                block_shape=self.quant_config.weight_block_size,
+            )
+        elif (prepare_finalize.activation_format ==
                 FusedMoEActivationFormat.BatchedExperts):
             max_num_tokens_per_rank = (
                 prepare_finalize.max_num_tokens_per_rank())
@@ -1028,7 +1037,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             logical_replica_count=logical_replica_count,
         )
 
-        if self.rocm_aiter_moe_enabled:
+        if self.moe.use_mori_kernels:
+            common_kwargs = dict(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=False,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                w1_scale=(layer.w13_weight_scale_inv
+                          if self.block_quant else layer.w13_weight_scale),
+                w2_scale=(layer.w2_weight_scale_inv
+                          if self.block_quant else layer.w2_weight_scale),
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+
+            return self.fused_experts(**common_kwargs)
+        elif self.rocm_aiter_moe_enabled:
             from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (  # noqa: E501
                 rocm_aiter_fused_experts)
             return rocm_aiter_fused_experts(

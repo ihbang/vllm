@@ -189,11 +189,19 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 use_fp8_dispatch=use_fp8_dispatch,
             )
         elif moe.use_mori_kernels:
+            scale_shape = moe.quant_config.scale_shape(
+                moe.max_num_tokens,
+                moe.hidden_dim,
+            )
+            scale_type_size = moe.quant_dtype.itemsize if moe.quant_dtype is not None else 0
             all_to_all_args = dict(
                 max_num_tokens=moe.max_num_tokens,
                 num_local_experts=moe.num_local_experts,
                 experts_per_token=moe.experts_per_token,
                 hidden_dim=moe.hidden_dim,
+                data_type=moe.in_dtype,
+                scale_dim=scale_shape[-1],
+                scale_type_size=scale_type_size,
             )
             handle = all2all_manager.get_handle(all_to_all_args)
 
@@ -296,7 +304,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # TODO(bnell): Remove. Every layer should have an moe config object.
         moe: FusedMoEConfig,
     ) -> FusedMoEPermuteExpertsUnpermute:
-        if (prepare_finalize.activation_format ==
+        if moe.use_mori_kernels and is_rocm_aiter_moe_enabled():
+            from vllm.model_executor.layers.fused_moe import AiterExperts
+            logger.debug("AiterExperts for Mori integration %s", self.moe)
+            return AiterExperts(
+                max_num_tokens=self.moe.max_num_tokens,
+                use_fp8_w8a8=False,
+            )
+        elif (prepare_finalize.activation_format ==
                 FusedMoEActivationFormat.BatchedExperts):
             logger.debug("BatchedTritonExperts %s", self.moe)
             return BatchedTritonExperts(
