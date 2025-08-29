@@ -10,8 +10,10 @@ from typing import Any, Optional
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+    TopKWeightAndReduceContiguous, TopKWeightAndReduceDelegate)
+from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -53,8 +55,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.num_dispatchers_ = num_dispatchers
         self.use_fp8_dispatch = use_fp8_dispatch
 
-        self._expert_num_tokens = None
-
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
@@ -88,6 +88,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     ]:
         """
         Prepare inputs for mori dispatch operation.
+        Optimized to minimize host-device synchronization points.
 
         Args:
             a1: Input hidden states [num_tokens, hidden_dim]
@@ -97,7 +98,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             quant_config: Quantization config
 
         Returns:
-            Tuple of (dispatched_x, batched_scales, expert_tokens_meta, None, None)
+            Tuple of (dispatched_x, batched_scales, expert_tokens_meta, dispatch_indices, dispatch_weights)
             where dispatched_x is in Standard format (2D tensor)
         """
         try:
@@ -115,39 +116,54 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 indices=topk_ids,
             )
 
-            total_recv_num_tokens = (
-                dispatch_recv_num_token[0].item()
-                if dispatch_recv_num_token.numel() > 0
-                else 0
-            )
+            if dispatch_recv_num_token.numel() > 0:
+                max_recv_tokens = dispatch_recv_num_token.max()
 
-            # For Standard format, expert tokens metadata is minimal
-            expert_num_tokens = torch.zeros(self.num_local_experts,
-                                          dtype=torch.int32,
-                                          device=a1.device)
+                actual_max = min(max_recv_tokens.item(), dispatch_output.size(0))
+                standard_output = dispatch_output[:actual_max]
+                valid_dispatch_weights = dispatch_weights[:actual_max] 
+                valid_dispatch_indices = dispatch_indices[:actual_max]
+            else:
+                # No tokens received
+                standard_output = torch.empty((0, a1.size(1)), dtype=a1.dtype, device=a1.device)
+                valid_dispatch_weights = torch.empty((0, topk_weights.size(1)), dtype=topk_weights.dtype, device=a1.device) 
+                valid_dispatch_indices = torch.empty((0, topk_ids.size(1)), dtype=topk_ids.dtype, device=a1.device)
+                actual_max = 0
+
+            if not hasattr(self, '_expert_tokens_buffer'):
+                self._expert_tokens_buffer = torch.zeros(self.num_local_experts,
+                                                       dtype=torch.int32,
+                                                       device=a1.device)
+            else:
+                self._expert_tokens_buffer.zero_()
             
-            # Estimate expert token distribution for metadata (approximate)
-            if total_recv_num_tokens > 0:
-                base_tokens_per_expert = total_recv_num_tokens // self.num_local_experts
-                remaining_tokens = total_recv_num_tokens % self.num_local_experts
-                for expert_idx in range(self.num_local_experts):
-                    expert_tokens = base_tokens_per_expert + (1 if expert_idx < remaining_tokens else 0)
-                    expert_num_tokens[expert_idx] = expert_tokens
+            expert_num_tokens = self._expert_tokens_buffer
+
+            if actual_max > 0:
+                # Estimate expert token distribution using GPU operations where possible
+                base_tokens_per_expert = actual_max // self.num_local_experts
+                remaining_tokens = actual_max % self.num_local_experts
+                
+                if base_tokens_per_expert > 0:
+                    expert_num_tokens.fill_(base_tokens_per_expert)
+                
+                if remaining_tokens > 0:
+                    expert_num_tokens[:remaining_tokens] += 1
 
             expert_tokens_meta = mk.ExpertTokensMetadata(
                 expert_num_tokens=expert_num_tokens,
                 expert_num_tokens_cpu=None
             )
 
-            # Store simplified metadata for finalize
-            self._expert_num_tokens = expert_num_tokens
+            # Store for finalize() - avoid recomputation
+            self._last_dispatch_size = actual_max
 
             return (
-                dispatch_output,
-                dispatch_scales,
+                standard_output,
+                None,
                 expert_tokens_meta,
-                dispatch_indices,
-                dispatch_weights,
+                valid_dispatch_indices,
+                valid_dispatch_weights,
             )
 
         except Exception as e:
@@ -172,40 +188,31 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             topk_weights: Original top-k weights
             topk_ids: Original top-k indices
         """
-        if self._expert_num_tokens is None:
-            raise RuntimeError(
-                "No expert token data found. Must call prepare() first."
-            )
+        assert self.handle is not None
 
         num_original_tokens = output.size(0)  # Original number of tokens
 
         try:
+            # fused_expert_output can have 0 tokens - This happens when none of the
+            # tokens from the all2all reach this EP rank.
+            if fused_expert_output.numel() != 0:
+                if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
+                    weight_and_reduce_impl = TopKWeightAndReduceContiguous()
+                fused_expert_output = weight_and_reduce_impl.apply(
+                    output=None,
+                    fused_expert_output=fused_expert_output,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                )
+
             combined_output, combined_weights = self.handle.combine(
                 input=fused_expert_output,
                 weights=topk_weights,
                 indices=topk_ids,
-                block_num=-1,          # Use default from config
-                warp_per_block=-1,     # Use default from config
-                call_reset=True,       # Reset internal state after combine
             )
 
-            # Copy result to output tensor, trimmed to original size
-            if combined_output.size(0) >= num_original_tokens:
-                output.copy_(combined_output[:num_original_tokens])
-            else:
-                # Handle edge case gracefully
-                logger.warning(
-                    f"Combined output smaller than expected: "
-                    f"{combined_output.size(0)} < {num_original_tokens}"
-                )
-                actual_size = min(combined_output.size(0), num_original_tokens)
-                if actual_size > 0:
-                    output[:actual_size].copy_(combined_output[:actual_size])
-                if actual_size < num_original_tokens:
-                    output[actual_size:].zero_()  # Zero remaining
-
-            # Clear cached data
-            self._expert_num_tokens = None
+            output.copy_(combined_output[:num_original_tokens], non_blocking=True)
 
         except Exception as e:
             logger.error(f"mori combine failed: {e}")

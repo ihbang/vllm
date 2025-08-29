@@ -359,16 +359,15 @@ class MoriAll2AllManager(All2AllManagerBase):
             num_experts_per_rank=num_local_experts,
             num_experts_per_token=experts_per_token,
 
-            # Performance tuning parameters (can be optimized later)
-            #warp_num_per_block=8,  # Good default for MI300X
-            #block_num=80,          # Good default for MI300X
+            # Performance tuning parameters
+            # warp_num_per_block=8,
+            # block_num=80,
             max_token_type_size=max_token_type_size,
 
-            # Quantization support (disabled for now)
+            # Quantization support
             scale_dim=scale_dim,
             scale_type_size=scale_type_size,
 
-            use_external_inp_buf=False,
             # Determine kernel type based on topology
             kernel_type=(EpDispatchCombineKernelType.InterNode
                         if self.internode
