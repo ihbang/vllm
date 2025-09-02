@@ -337,7 +337,8 @@ class MoriAll2AllManager(All2AllManagerBase):
     def _make_mori_config(self, max_num_tokens: int, num_local_experts: int,
                           experts_per_token: int, hidden_dim: int,
                           scale_dim: int, scale_type_size: int,
-                          data_type: torch.dtype = torch.bfloat16):
+                          data_type: torch.dtype = torch.bfloat16,
+                          quant_dtype: torch.dtype = None):
         """Create mori EpDispatchCombineConfig"""
         import mori.ops.dispatch_combine as mori_ops
         from mori.ops.dispatch_combine import EpDispatchCombineKernelType
@@ -351,7 +352,7 @@ class MoriAll2AllManager(All2AllManagerBase):
         max_token_type_size = dtype_to_size.get(data_type, 2)
 
         config = mori_ops.EpDispatchCombineConfig(
-            data_type=data_type,
+            data_type=data_type if quant_dtype is None else quant_dtype,
             rank=self.rank,
             world_size=self.world_size,
             hidden_dim=hidden_dim,

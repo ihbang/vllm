@@ -53,7 +53,9 @@ def get_config_quant_dtype(
     use_mxfp4_w4a4: bool,
 ) -> Union[None, torch.dtype, str]:
     if use_fp8_w8a8:
-        return torch.float8_e4m3fn
+        # Use platform-specific FP8 dtype instead of hardcoded one
+        from vllm.platforms import current_platform
+        return current_platform.fp8_dtype()
     elif use_int8_w8a8:
         return torch.int8
     elif use_mxfp4_w4a4:
@@ -451,13 +453,17 @@ class FusedMoEConfig:
 
                 if input_quant.num_bits == 8:
                     if input_quant.type == QuantizationType.FLOAT:
-                        quant_dtype = torch.float8_e4m3fn
+                        # Use platform-specific FP8 dtype instead of hardcoded one
+                        from vllm.platforms import current_platform
+                        quant_dtype = current_platform.fp8_dtype()
                     elif input_quant.type == QuantizationType.INT:
                         quant_dtype = torch.int8
 
             from vllm.model_executor.layers.quantization.fp8 import Fp8Config
             if quant_dtype is None and isinstance(quant_config, Fp8Config):
-                quant_dtype = torch.float8_e4m3fn
+                # Use platform-specific FP8 dtype instead of hardcoded one
+                from vllm.platforms import current_platform
+                quant_dtype = current_platform.fp8_dtype()
 
             from vllm.model_executor.layers.quantization.modelopt import (
                 ModelOptNvFp4Config)

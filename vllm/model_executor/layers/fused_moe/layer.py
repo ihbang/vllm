@@ -193,21 +193,23 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 moe.max_num_tokens,
                 moe.hidden_dim,
             )
-            scale_type_size = moe.quant_dtype.itemsize if moe.quant_dtype is not None else 0
+            scale_type_size = torch.float32.itemsize # aiter quantization uses float32 scale
+            use_fp8_dispatch = (moe.quant_config is not None
+                                and moe.quant_config.quant_dtype
+                                == current_platform.fp8_dtype())
+            quant_dtype = moe.quant_config.quant_dtype if use_fp8_dispatch else None
+
             all_to_all_args = dict(
                 max_num_tokens=moe.max_num_tokens,
                 num_local_experts=moe.num_local_experts,
                 experts_per_token=moe.experts_per_token,
                 hidden_dim=moe.hidden_dim,
                 data_type=moe.in_dtype,
+                quant_dtype=quant_dtype,
                 scale_dim=scale_shape[-1],
                 scale_type_size=scale_type_size,
             )
             handle = all2all_manager.get_handle(all_to_all_args)
-
-            use_fp8_dispatch = (moe.quant_config is not None
-                                and moe.quant_config.quant_dtype
-                                == current_platform.fp8_dtype())
 
             prepare_finalize = MoriPrepareAndFinalize(
                 handle,

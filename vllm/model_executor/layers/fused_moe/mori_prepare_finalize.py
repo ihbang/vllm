@@ -11,8 +11,6 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
-from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
-    TopKWeightAndReduceContiguous, TopKWeightAndReduceDelegate)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -88,7 +86,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     ]:
         """
         Prepare inputs for mori dispatch operation.
-        Optimized to minimize host-device synchronization points.
+        Supports pre-dispatch quantization to reduce communication overhead.
 
         Args:
             a1: Input hidden states [num_tokens, hidden_dim]
@@ -102,7 +100,31 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             where dispatched_x is in Standard format (2D tensor)
         """
         try:
-            # Perform mori dispatch
+            # Pre-dispatch quantization to reduce communication overhead
+            dispatch_input = a1
+            scales = None
+
+            if self.use_fp8_dispatch:
+                from aiter import get_hip_quant
+                from aiter import QuantType
+
+                block_shape = quant_config.block_shape
+                if block_shape is not None:
+                    assert not apply_router_weight_on_input, (
+                        "apply_router_weight_on_input is"
+                        " not supported for block scaled moe"
+                    )
+                    quant_type = QuantType.per_1x128
+                else:
+                    quant_type = QuantType.per_Token
+
+                quant_func = get_hip_quant(quant_type)
+
+                dispatch_input, scales = quant_func(
+                    a1,
+                    quant_dtype=quant_config.quant_dtype,
+                )
+
             (
                 dispatch_output,
                 dispatch_weights,
@@ -110,60 +132,23 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 dispatch_indices,
                 dispatch_recv_num_token,
             ) = self.handle.dispatch(
-                input=a1,
+                input=dispatch_input,
                 weights=topk_weights,
-                scales=None,
+                scales=scales,
                 indices=topk_ids,
             )
 
-            if dispatch_recv_num_token.numel() > 0:
-                max_recv_tokens = dispatch_recv_num_token.max()
-
-                actual_max = min(max_recv_tokens.item(), dispatch_output.size(0))
-                standard_output = dispatch_output[:actual_max]
-                valid_dispatch_weights = dispatch_weights[:actual_max] 
-                valid_dispatch_indices = dispatch_indices[:actual_max]
-            else:
-                # No tokens received
-                standard_output = torch.empty((0, a1.size(1)), dtype=a1.dtype, device=a1.device)
-                valid_dispatch_weights = torch.empty((0, topk_weights.size(1)), dtype=topk_weights.dtype, device=a1.device) 
-                valid_dispatch_indices = torch.empty((0, topk_ids.size(1)), dtype=topk_ids.dtype, device=a1.device)
-                actual_max = 0
-
-            if not hasattr(self, '_expert_tokens_buffer'):
-                self._expert_tokens_buffer = torch.zeros(self.num_local_experts,
-                                                       dtype=torch.int32,
-                                                       device=a1.device)
-            else:
-                self._expert_tokens_buffer.zero_()
-            
-            expert_num_tokens = self._expert_tokens_buffer
-
-            if actual_max > 0:
-                # Estimate expert token distribution using GPU operations where possible
-                base_tokens_per_expert = actual_max // self.num_local_experts
-                remaining_tokens = actual_max % self.num_local_experts
-                
-                if base_tokens_per_expert > 0:
-                    expert_num_tokens.fill_(base_tokens_per_expert)
-                
-                if remaining_tokens > 0:
-                    expert_num_tokens[:remaining_tokens] += 1
-
             expert_tokens_meta = mk.ExpertTokensMetadata(
-                expert_num_tokens=expert_num_tokens,
-                expert_num_tokens_cpu=None
+                expert_num_tokens=dispatch_recv_num_token,
+                expert_num_tokens_cpu=None,
             )
 
-            # Store for finalize() - avoid recomputation
-            self._last_dispatch_size = actual_max
-
             return (
-                standard_output,
-                None,
+                dispatch_output,
+                dispatch_scales,
                 expert_tokens_meta,
-                valid_dispatch_indices,
-                valid_dispatch_weights,
+                dispatch_indices,
+                dispatch_weights,
             )
 
         except Exception as e:
@@ -199,7 +184,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 indices=topk_ids,
             )
 
-            output.copy_(combined_output[:num_original_tokens], non_blocking=True)
+            output.copy_(
+                combined_output[:num_original_tokens], non_blocking=True
+            )
 
         except Exception as e:
             logger.error(f"mori combine failed: {e}")
