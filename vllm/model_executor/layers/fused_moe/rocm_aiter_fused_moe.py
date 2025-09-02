@@ -187,6 +187,7 @@ def rocm_aiter_fused_moe_impl(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     expert_num_tokens: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
@@ -194,7 +195,7 @@ def rocm_aiter_fused_moe_impl(
     # Check if input is already pre-quantized (from mori dispatch)
     input_is_pre_quantized = (a1_scale is not None and
                               hidden_states.dtype == torch.float8_e4m3fnuz)
-    dtype = torch.bfloat16 if input_is_pre_quantized else None
+    dtype = output_dtype if input_is_pre_quantized else None
 
     activation = ActivationType(activation_method)
     quant_type = QuantType(quant_method)
@@ -221,6 +222,7 @@ def rocm_aiter_fused_moe_fake(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     expert_num_tokens: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -327,6 +329,7 @@ def rocm_aiter_fused_experts(
         block_shape: Optional[list[int]] = None,
         expert_map: Optional[torch.Tensor] = None,
         expert_num_tokens: Optional[torch.Tensor] = None,
+        output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
 
     activation_method = (ActivationMethod.SILU
@@ -404,6 +407,7 @@ def rocm_aiter_fused_experts(
             a2_scale=a2_scale,
             doweight_stage1=apply_router_weight_on_input,
             expert_num_tokens=expert_num_tokens,
+            output_dtype=output_dtype,
         )
 
 

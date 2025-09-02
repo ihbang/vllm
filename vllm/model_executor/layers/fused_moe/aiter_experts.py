@@ -144,6 +144,7 @@ class AiterExperts(mk.FusedMoEPermuteExpertsUnpermute):
             block_shape=self.block_shape,
             expert_map=expert_map,
             expert_num_tokens=expert_tokens_meta.expert_num_tokens,
+            output_dtype=output.dtype,
         )
 
         # Copy result to output tensor
