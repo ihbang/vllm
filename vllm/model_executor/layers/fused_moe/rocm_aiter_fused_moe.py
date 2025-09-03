@@ -186,16 +186,25 @@ def rocm_aiter_fused_moe_impl(
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    expert_num_tokens: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
+
+    # Check if input is already pre-quantized (from mori dispatch)
+    input_is_pre_quantized = (a1_scale is not None and
+                              hidden_states.dtype == torch.float8_e4m3fnuz)
+    dtype = output_dtype if input_is_pre_quantized else None
 
     activation = ActivationType(activation_method)
     quant_type = QuantType(quant_method)
 
     return fused_moe(hidden_states, w1, w2, topk_weight, topk_ids, expert_mask,
                      activation, quant_type, doweight_stage1, w1_scale,
-                     w2_scale, a1_scale, a2_scale)
+                     w2_scale, a1_scale, a2_scale,
+                     num_local_tokens=expert_num_tokens,
+                     dtype=dtype)
 
 
 def rocm_aiter_fused_moe_fake(
@@ -212,6 +221,8 @@ def rocm_aiter_fused_moe_fake(
     w2_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    expert_num_tokens: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -316,7 +327,10 @@ def rocm_aiter_fused_experts(
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
         block_shape: Optional[list[int]] = None,
-        expert_map: Optional[torch.Tensor] = None) -> torch.Tensor:
+        expert_map: Optional[torch.Tensor] = None,
+        expert_num_tokens: Optional[torch.Tensor] = None,
+        output_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
 
     activation_method = (ActivationMethod.SILU
                          if activation == "silu" else ActivationMethod.GELU)
@@ -391,7 +405,10 @@ def rocm_aiter_fused_experts(
             w2_scale=w2_scale,
             a1_scale=a1_scale,
             a2_scale=a2_scale,
-            doweight_stage1=apply_router_weight_on_input)
+            doweight_stage1=apply_router_weight_on_input,
+            expert_num_tokens=expert_num_tokens,
+            output_dtype=output_dtype,
+        )
 
 
 def rocm_aiter_topk_softmax(topk_weights: torch.Tensor,
